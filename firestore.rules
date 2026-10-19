@@ -169,7 +169,7 @@ service cloud.firestore {
       allow list: if isOwner();
       allow create: if request.auth != null
         && request.resource.data.keys().hasOnly([
-          'visitorTyping', 'ownerTyping', 'updatedAt'
+          'visitorTyping', 'ownerTyping', 'updatedAt', 'visitorUpdatedAt', 'ownerUpdatedAt'
         ])
         && request.resource.data.keys().hasAll([
           'visitorTyping', 'ownerTyping', 'updatedAt'
@@ -187,10 +187,14 @@ service cloud.firestore {
           (
             isOwner()
             && request.resource.data.visitorTyping == false
+            && request.resource.data.ownerUpdatedAt == request.time
+            && !request.resource.data.keys().hasAny(['visitorUpdatedAt'])
           )
           || (
             request.auth.uid == threadId
             && request.resource.data.ownerTyping == false
+            && request.resource.data.visitorUpdatedAt == request.time
+            && !request.resource.data.keys().hasAny(['ownerUpdatedAt'])
           )
         );
       allow update: if request.auth != null
@@ -205,14 +209,16 @@ service cloud.firestore {
           (
             isOwner()
             && request.resource.data.ownerTyping is bool
+            && request.resource.data.ownerUpdatedAt == request.time
             && request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['ownerTyping', 'updatedAt'])
+              .hasOnly(['ownerTyping', 'ownerUpdatedAt', 'updatedAt'])
           )
           || (
             request.auth.uid == threadId
             && request.resource.data.visitorTyping is bool
+            && request.resource.data.visitorUpdatedAt == request.time
             && request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['visitorTyping', 'updatedAt'])
+              .hasOnly(['visitorTyping', 'visitorUpdatedAt', 'updatedAt'])
           )
         );
       allow delete: if isOwner();
