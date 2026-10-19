@@ -37,6 +37,7 @@ import {
 } from "./services/visitor-names.js";
 import {
   blockCursorOffset,
+  insertionPoint,
   isAllowedFocusTarget,
   isAllowedTextInput
 } from "./services/input-policy.js";
@@ -55,6 +56,8 @@ let stopVisitorAccountWatch = null;
 let inactivityTimer = null;
 let typingTimer = null;
 let typingExpiryTimer = null;
+let typingWriteQueue = Promise.resolve();
+let lastTypingWriteAt = 0;
 let typingWatchGeneration = 0;
 let messageWatchGeneration = 0;
 let messages = [];
@@ -89,6 +92,10 @@ let visitorErrorLine = null;
 let lastActivityWrite = 0;
 let storageWarningShown = false;
 let activeCursorUpdater = null;
+let visitorFollowLatest = true;
+const ownerTranscriptStates = new Map();
+const ownerReplyDrafts = new Map();
+let renderedOwnerThreadId = "";
 
 function timestampMillis(value) {
   return typeof value?.toMillis === "function" ? value.toMillis() : 0;
@@ -117,15 +124,32 @@ function refreshTypingIndicator() {
   const dots = isOwner ? ownerTypingDots : visitorTypingDots;
   if (!label || !dots) return;
 
-  const updatedAt = timestampMillis(typingState?.updatedAt);
-  const fresh = !typingError && updatedAt > 0 && Date.now() - updatedAt < 5_000;
-  const otherIsTyping = fresh && (
-    isOwner ? typingState?.visitorTyping === true : typingState?.ownerTyping === true
-  );
+  window.clearTimeout(typingExpiryTimer);
+  typingExpiryTimer = null;
+  const otherRole = isOwner ? "visitor" : "owner";
+  const updatedAt = timestampMillis(typingState?.[`${otherRole}UpdatedAt`]);
+  const age = Date.now() - updatedAt;
+  const otherIsTyping = !typingError &&
+    typingState?.[`${otherRole}Typing`] === true &&
+    updatedAt > 0 && age >= 0 && age < 5_000;
   const otherName = isOwner ? typingOtherName : "Dark";
   label.textContent = otherIsTyping ? `${otherName} is typing` : "";
   label.parentElement.hidden = !otherIsTyping;
   dots.classList.toggle("active", otherIsTyping);
+  if (otherIsTyping) {
+    typingExpiryTimer = window.setTimeout(refreshTypingIndicator, 5_000 - age);
+  }
+}
+
+function publishTypingState(isTyping) {
+  const threadIds = [...activeTypingThreadIds];
+  const sender = activeTypingSender;
+  lastTypingWriteAt = Date.now();
+  typingWriteQueue = typingWriteQueue.then(
+    () => setTypingState(threadIds, sender, isTyping)
+  ).catch((error) => {
+    console.warn("Could not update typing status.", error);
+  });
 }
 
 function clearLocalTyping() {
@@ -133,10 +157,7 @@ function clearLocalTyping() {
   typingTimer = null;
   if (!localTypingActive || !activeTypingThreadId || !activeTypingSender) return;
   localTypingActive = false;
-  void setTypingState(activeTypingThreadIds, activeTypingSender, false).catch((error) => {
-    typingError = error.message || "Could not update typing status.";
-    refreshTypingIndicator();
-  });
+  publishTypingState(false);
 }
 
 function updateLocalTyping(threadId, sender, isTyping) {
@@ -147,10 +168,9 @@ function updateLocalTyping(threadId, sender, isTyping) {
   if (isTyping) {
     if (!localTypingActive) {
       localTypingActive = true;
-      void setTypingState(activeTypingThreadIds, sender, true).catch((error) => {
-        typingError = error.message || "Could not update typing status.";
-        refreshTypingIndicator();
-      });
+      publishTypingState(true);
+    } else if (Date.now() - lastTypingWriteAt >= 1_500) {
+      publishTypingState(true);
     }
     typingTimer = window.setTimeout(clearLocalTyping, 2_000);
     return;
@@ -181,6 +201,7 @@ function watchTypingForThread(
   activeTypingThreadId = threadId;
   activeTypingThreadIds = threadIds;
   activeTypingSender = sender;
+  lastTypingWriteAt = 0;
   typingState = null;
   typingError = "";
   typingOtherName = otherName;
@@ -191,33 +212,29 @@ function watchTypingForThread(
 
   const onTypingStates = (states) => {
     if (watchGeneration !== typingWatchGeneration || activeTypingThreadId !== threadId) return;
-    window.clearTimeout(typingExpiryTimer);
     const now = Date.now();
-    const freshStates = [...states.values()].filter((state) => {
-      const updatedAt = timestampMillis(state?.updatedAt);
-      return updatedAt > 0 && now - updatedAt < 5_000;
-    });
+    const latestTimestamp = (role) => [...states.values()].reduce((latest, state) => {
+      const updatedAt = timestampMillis(state?.[`${role}UpdatedAt`] ?? state?.updatedAt);
+      return state?.[`${role}Typing`] === true && updatedAt > 0 &&
+        now - updatedAt >= 0 && now - updatedAt < 5_000
+        ? Math.max(latest, updatedAt)
+        : latest;
+    }, 0);
+    const visitorUpdatedAt = latestTimestamp("visitor");
+    const ownerUpdatedAt = latestTimestamp("owner");
     typingState = {
-      visitorTyping: freshStates.some((state) => state.visitorTyping === true),
-      ownerTyping: freshStates.some((state) => state.ownerTyping === true),
-      updatedAt: freshStates.reduce((latest, state) =>
-        timestampMillis(state.updatedAt) > timestampMillis(latest)
-          ? state.updatedAt
-          : latest, null)
+      visitorTyping: visitorUpdatedAt > 0,
+      visitorUpdatedAt,
+      ownerTyping: ownerUpdatedAt > 0,
+      ownerUpdatedAt
     };
     typingError = "";
-    const updatedAt = timestampMillis(typingState.updatedAt);
-    const expiresIn = 5_000 - (Date.now() - updatedAt);
-    if (typingState.visitorTyping || typingState.ownerTyping) {
-      if (expiresIn > 0) {
-        typingExpiryTimer = window.setTimeout(refreshTypingIndicator, expiresIn);
-      }
-    }
     refreshTypingIndicator();
   };
   const onTypingError = (error) => {
     if (watchGeneration !== typingWatchGeneration || activeTypingThreadId !== threadId) return;
     typingError = error.message || "Could not load typing status.";
+    console.warn("Could not load typing status.", error);
     refreshTypingIndicator();
   };
   stopTypingWatch = sender === "owner"
@@ -421,20 +438,25 @@ function makeLine(text = "", className = "") {
 
 function makeInput(label, value = "", type = "text") {
   const row = document.createElement("div");
-  row.className = "input-row";
+  row.className = `input-row${label === "whats your name ?" ? " name-prompt-row" : ""}`;
 
   const labelNode = document.createElement("label");
   labelNode.className = "prompt";
   labelNode.textContent = label;
 
-  const input = document.createElement("input");
+  const isTextarea = type === "textarea";
+  const input = document.createElement(isTextarea ? "textarea" : "input");
   input.className = "terminal-input";
-  input.type = type;
+  if (!isTextarea) input.type = type;
   input.dataset.chatInput = "true";
-  input.autocomplete = type === "password" ? "current-password" : "off";
+  if (!isTextarea) input.autocomplete = type === "password" ? "current-password" : "off";
   input.spellcheck = false;
   input.value = value;
   input.setAttribute("aria-label", label.replace(/:\s*$/, ""));
+  if (isTextarea) {
+    input.rows = 1;
+    input.addEventListener("input", () => resizeComposer(input));
+  }
   labelNode.append(input);
   row.append(labelNode);
 
@@ -446,6 +468,16 @@ function makeInput(label, value = "", type = "text") {
   return { row, input };
 }
 
+function resizeComposer(input) {
+  input.style.height = "auto";
+  const maxHeight = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  const nextHeight = Number.isFinite(maxHeight)
+    ? Math.min(input.scrollHeight, maxHeight)
+    : input.scrollHeight;
+  input.style.height = `${nextHeight}px`;
+  input.style.overflowY = input.scrollHeight > nextHeight ? "auto" : "hidden";
+}
+
 function attachBlockCursor(input) {
   const prompt = input.parentElement;
   const cursor = document.createElement("span");
@@ -455,34 +487,90 @@ function attachBlockCursor(input) {
   prompt.classList.add("input-prompt");
   prompt.append(cursor);
 
+  const mirror = input.tagName === "TEXTAREA"
+    ? document.createElement("div")
+    : null;
+  const marker = mirror ? document.createElement("span") : null;
+  if (mirror && marker) {
+    mirror.setAttribute("aria-hidden", "true");
+    mirror.style.cssText = [
+      "position:fixed",
+      "top:0",
+      "left:-10000px",
+      "visibility:hidden",
+      "pointer-events:none",
+      "overflow:hidden",
+      "height:auto",
+      "min-height:0",
+      "max-height:none",
+      "white-space:pre-wrap",
+      "overflow-wrap:anywhere",
+      "word-break:break-word"
+    ].join(";");
+    marker.textContent = "\u200b";
+    mirror.append(marker);
+    prompt.append(mirror);
+  }
+
   let frame = 0;
   const updatePosition = () => {
     if (frame) return;
     frame = window.requestAnimationFrame(() => {
       frame = 0;
-      const selection = input.selectionStart ?? input.value.length;
-      if (cursorMeasureContext) {
-        cursorMeasureContext.font = window.getComputedStyle(input).font;
+      if (!input.isConnected) return;
+      const selection = insertionPoint(input);
+      const inputStyle = window.getComputedStyle(input);
+      const inputRect = input.getBoundingClientRect();
+      const promptRect = prompt.getBoundingClientRect();
+      if (mirror && marker) {
+        const copiedProperties = [
+          "font", "lineHeight", "letterSpacing", "wordSpacing", "textTransform",
+          "textIndent", "textAlign", "paddingTop", "paddingRight", "paddingBottom",
+          "paddingLeft", "borderTopWidth", "borderRightWidth", "borderBottomWidth",
+          "borderLeftWidth", "boxSizing", "direction", "tabSize"
+        ];
+        for (const property of copiedProperties) {
+          mirror.style[property] = inputStyle[property];
+        }
+        mirror.style.width = `${inputRect.width}px`;
+        const prefix = input.value.slice(0, selection);
+        mirror.replaceChildren(document.createTextNode(prefix), marker);
+        const markerRect = marker.getBoundingClientRect();
+        cursor.style.left = `${markerRect.left - promptRect.left - input.scrollLeft}px`;
+        cursor.style.top = `${markerRect.top - promptRect.top - input.scrollTop}px`;
+      } else {
+        if (cursorMeasureContext) {
+          cursorMeasureContext.font = inputStyle.font;
+        }
+        const selectedText = input.type === "password"
+          ? "•".repeat(selection)
+          : input.value.slice(0, selection);
+        const letterSpacing = Number.parseFloat(inputStyle.letterSpacing) || 0;
+        const textWidth = cursorMeasureContext
+          ? cursorMeasureContext.measureText(selectedText).width +
+            Math.max(0, [...selectedText].length - 1) * letterSpacing
+          : 0;
+        const leftInset = Number.parseFloat(inputStyle.paddingLeft) +
+          Number.parseFloat(inputStyle.borderLeftWidth);
+        cursor.style.left = `${blockCursorOffset(
+          inputRect,
+          promptRect,
+          textWidth + (Number.isFinite(leftInset) ? leftInset : 0),
+          input.scrollLeft
+        )}px`;
+        cursor.style.top = `${inputRect.top - promptRect.top}px`;
       }
-      const textWidth = cursorMeasureContext?.measureText(input.value.slice(0, selection)).width || 0;
-      cursor.style.left = `${blockCursorOffset(
-        input.getBoundingClientRect(),
-        prompt.getBoundingClientRect(),
-        textWidth,
-        input.scrollLeft
-      )}px`;
     });
   };
 
+  activeCursorUpdater = updatePosition;
   input.addEventListener("focus", () => {
     activeCursorUpdater = updatePosition;
     updatePosition();
   });
-  input.addEventListener("blur", () => {
-    if (activeCursorUpdater === updatePosition) activeCursorUpdater = null;
-    updatePosition();
-  });
-  for (const eventName of ["input", "select", "keyup", "click", "scroll"]) {
+  for (const eventName of [
+    "input", "select", "keyup", "click", "pointerup", "scroll", "compositionend"
+  ]) {
     input.addEventListener(eventName, updatePosition);
   }
   updatePosition();
@@ -573,15 +661,23 @@ function showNamePrompt(errorText = "") {
   });
 }
 
+function isAtLatest(container) {
+  return container.scrollHeight - container.scrollTop - container.clientHeight <= 48;
+}
+
 function showMessagePrompt(name) {
   currentVisitorName = name;
+  visitorFollowLatest = true;
   app.replaceChildren();
-  app.className = "terminal";
+  app.className = "terminal visitor-chat";
   app.append(makeLine("olny way to the dark"));
 
   visitorTranscript = document.createElement("div");
   visitorTranscript.className = "visitor-transcript";
   visitorTranscript.setAttribute("aria-live", "polite");
+  visitorTranscript.addEventListener("scroll", () => {
+    visitorFollowLatest = isAtLatest(visitorTranscript);
+  });
   const typing = makeTypingIndicator();
   visitorTypingLabel = typing.label;
   visitorTypingDots = typing.dots;
@@ -600,7 +696,7 @@ function showMessagePrompt(name) {
   const addComposer = () => {
     const entry = document.createElement("div");
     entry.className = "message-entry";
-    const { row, input } = makeInput("", "", "text");
+    const { row, input } = makeInput("", "", "textarea");
     input.classList.add("chat-input");
     input.maxLength = MAX_MESSAGE_LENGTH;
     input.setAttribute("aria-label", "Message");
@@ -611,10 +707,11 @@ function showMessagePrompt(name) {
     status.setAttribute("role", "status");
     entry.append(row, status);
     app.append(entry);
+    resizeComposer(input);
     focusForDesktop(input);
     row.addEventListener("click", () => input.focus());
     input.addEventListener("keydown", async (event) => {
-      if (event.key !== "Enter") return;
+      if (event.key !== "Enter" || event.shiftKey) return;
       event.preventDefault();
       const text = input.value.trim();
       if (!text || input.disabled) return;
@@ -667,10 +764,12 @@ function createChatMessage(message, threadName = "", showSource = false) {
 
 function renderVisitorTranscript() {
   if (!visitorTranscript) return;
+  const shouldFollow = visitorFollowLatest;
   visitorTranscript.replaceChildren();
   for (const message of visitorMessages) {
     visitorTranscript.append(createChatMessage(message, currentVisitorName));
   }
+  if (shouldFollow) visitorTranscript.scrollTop = visitorTranscript.scrollHeight;
 }
 
 function showOwnerPasswordPrompt() {
@@ -755,6 +854,16 @@ async function ensureVisitorNames(currentMessages) {
 }
 
 function showOwnerInterface() {
+  const previousReply = app.querySelector(".owner-reply-composer .chat-input");
+  const previousReplyFocused = previousReply && document.activeElement === previousReply;
+  if (previousReply && renderedOwnerThreadId && !previousReply.disabled) {
+    ownerReplyDrafts.set(renderedOwnerThreadId, {
+      value: previousReply.value,
+      selectionStart: previousReply.selectionStart,
+      selectionEnd: previousReply.selectionEnd,
+      scrollTop: previousReply.scrollTop
+    });
+  }
   app.replaceChildren();
   app.className = `owner-layout${sidebarOpen ? "" : " sidebar-closed"}`;
 
@@ -891,6 +1000,22 @@ function showOwnerInterface() {
     for (const message of currentMessages) {
       transcript.append(createChatMessage(message, thread.name, true));
     }
+    const transcriptState = ownerTranscriptStates.get(thread.id) || {
+      scrollTop: 0,
+      followLatest: true
+    };
+    transcript.addEventListener("scroll", () => {
+      ownerTranscriptStates.set(thread.id, {
+        scrollTop: transcript.scrollTop,
+        followLatest: isAtLatest(transcript)
+      });
+    });
+    window.requestAnimationFrame(() => {
+      if (!transcript.isConnected) return;
+      transcript.scrollTop = transcriptState.followLatest
+        ? transcript.scrollHeight
+        : transcriptState.scrollTop;
+    });
     main.append(transcript);
 
     if (!thread.activeAccounts.size) {
@@ -902,15 +1027,32 @@ function showOwnerInterface() {
       }
       if (ownerNotice) main.append(makeLine(ownerNotice, "status"));
       app.append(sidebar, main);
+      renderedOwnerThreadId = thread.id;
       return;
     }
 
     const reply = document.createElement("div");
     reply.className = "owner-reply-composer";
-    const { row, input } = makeInput("", "", "text");
+    const draft = ownerReplyDrafts.get(thread.id);
+    const { row, input } = makeInput("", draft?.value || "", "textarea");
     input.classList.add("chat-input");
     input.maxLength = MAX_MESSAGE_LENGTH;
     input.setAttribute("aria-label", "Reply");
+    input.addEventListener("input", () => {
+      ownerReplyDrafts.set(thread.id, {
+        value: input.value,
+        selectionStart: input.selectionStart,
+        selectionEnd: input.selectionEnd,
+        scrollTop: input.scrollTop
+      });
+    });
+    input.addEventListener("scroll", () => {
+      const savedDraft = ownerReplyDrafts.get(thread.id);
+      if (savedDraft) ownerReplyDrafts.set(thread.id, {
+        ...savedDraft,
+        scrollTop: input.scrollTop
+      });
+    });
     input.addEventListener("input", () => {
       updateLocalTyping(thread.id, "owner", Boolean(input.value.trim()));
     });
@@ -924,9 +1066,19 @@ function showOwnerInterface() {
       if (!text || input.disabled) return;
       input.disabled = true;
       updateLocalTyping(thread.id, "owner", false);
+      let timeoutId;
       try {
-        await sendReply(text, [...thread.activeAccounts]);
+        await Promise.race([
+          sendReply(text, [...thread.activeAccounts]),
+          new Promise((_, reject) => {
+            timeoutId = window.setTimeout(
+              () => reject(new Error("No confirmation from Firebase. Delivery is unconfirmed; check your connection before retrying.")),
+              20_000
+            );
+          })
+        ]);
         replyError = "";
+        ownerReplyDrafts.delete(thread.id);
         showOwnerInterface();
       } catch (error) {
         replyError = error.message || "Reply could not be sent.";
@@ -934,10 +1086,24 @@ function showOwnerInterface() {
         status.textContent = replyError;
         input.disabled = false;
         input.focus();
+      } finally {
+        window.clearTimeout(timeoutId);
       }
     });
     reply.append(row, status);
     main.append(reply);
+    resizeComposer(input);
+    if (draft) {
+      input.setSelectionRange(draft.selectionStart, draft.selectionEnd);
+      input.scrollTop = draft.scrollTop || 0;
+    }
+    if (previousReplyFocused && renderedOwnerThreadId === thread.id) {
+      input.focus();
+      if (draft) {
+        input.setSelectionRange(draft.selectionStart, draft.selectionEnd);
+        input.scrollTop = draft.scrollTop || 0;
+      }
+    }
   } else {
     main.append(makeLine("Select a user."));
   }
@@ -948,6 +1114,7 @@ function showOwnerInterface() {
   }
   if (ownerNotice) main.append(makeLine(ownerNotice, "status"));
   app.append(sidebar, main);
+  renderedOwnerThreadId = thread?.id || "";
 }
 
 function startMessageListener(isOwner, threadId) {
@@ -1096,8 +1263,24 @@ async function handleAuthChange(user) {
 
 async function boot() {
   await startup();
-  window.addEventListener("resize", () => activeCursorUpdater?.());
+  const updateViewportLayout = () => {
+    activeCursorUpdater?.();
+    if (visitorTranscript && visitorFollowLatest) {
+      visitorTranscript.scrollTop = visitorTranscript.scrollHeight;
+    }
+    const ownerTranscript = app.querySelector(".owner-transcript");
+    const ownerState = ownerTranscriptStates.get(renderedOwnerThreadId);
+    if (ownerTranscript && (ownerState?.followLatest ?? true)) {
+      ownerTranscript.scrollTop = ownerTranscript.scrollHeight;
+    }
+  };
+  window.addEventListener("resize", updateViewportLayout);
+  window.visualViewport?.addEventListener("resize", updateViewportLayout);
+  window.visualViewport?.addEventListener("scroll", updateViewportLayout);
   void document.fonts?.ready.then(() => activeCursorUpdater?.());
+  document.addEventListener("selectionchange", () => {
+    if (document.activeElement?.dataset?.chatInput === "true") activeCursorUpdater?.();
+  });
   document.addEventListener("focusin", (event) => {
     if (isAllowedFocusTarget(event.target)) return;
     event.target.blur?.();
