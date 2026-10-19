@@ -174,6 +174,7 @@ export async function setTypingState(threadIds, sender, isTyping) {
     throw new Error("Visitors can only update their own typing status.");
   }
 
+  const timestampField = `${sender}UpdatedAt`;
   await Promise.all(uids.map(async (uid) => {
     const stateRef = doc(typingStatesCollection(), uid);
     await runTransaction(database, async (transaction) => {
@@ -182,6 +183,7 @@ export async function setTypingState(threadIds, sender, isTyping) {
       if (state.exists()) {
         transaction.set(stateRef, {
           [sender === "owner" ? "ownerTyping" : "visitorTyping"]: isTyping,
+          [timestampField]: updatedAt,
           updatedAt
         }, { merge: true });
         return;
@@ -190,6 +192,7 @@ export async function setTypingState(threadIds, sender, isTyping) {
       transaction.set(stateRef, {
         visitorTyping: sender === "visitor" && isTyping,
         ownerTyping: sender === "owner" && isTyping,
+        [timestampField]: updatedAt,
         updatedAt
       }, { merge: true });
     });
